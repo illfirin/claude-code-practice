@@ -1,0 +1,280 @@
+// Shared by the learn app's tests: lesson 1 driven through the reducer, with
+// the check's real FAIL messages, so tests can look at every screen.
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadCourse, parseLesson } from '../../learn/lib/content.mjs';
+import { DEFER_MS, initialState, reduce } from '../../learn/lib/flow.mjs';
+import { versionSaved } from '../lessons/b-1.mjs';
+import { openRepo } from '../repo.mjs';
+import { repo, withRepo, write } from './helpers.mjs';
+
+export const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const course = loadCourse(root);
+export const FACTS = { root: '/home/sam/claude-code-practice', name: 'Sam', gitError: null, practiceDir: true, codespace: false, win32: false };
+
+// The b-1 item's real result for a version.txt holding `text` (null: no file).
+export function b1Item(text) {
+  return withRepo(() => repo(), (dir) => {
+    if (text !== null) write(dir, { '.practice/version.txt': text });
+    const outcome = versionSaved.check(openRepo(dir));
+    return { index: 0, text: versionSaved.text, pass: outcome === true, hint: outcome === true ? '' : outcome.replace(dir, FACTS.root) };
+  });
+}
+
+// The course with lesson 1 as the only lesson in the app, whatever else
+// learn/lessons holds, so a test of lesson 1 alone stays put.
+export const b1Only = course.map((l) => (l.id === 'b-1' ? l : { ...l, content: null }));
+// That course, with made-up content files for some lessons, { id: text }.
+export const courseWith = (texts) => b1Only.map((l) => (texts[l.id] ? { ...l, content: parseLesson(texts[l.id], `${l.id}.md`) } : l));
+
+// A made-up lesson 2 with what lesson 1 doesn't have: three warm-ups, a
+// third terminal, and a step that redoes an earlier one.
+export const DEMO_B2 = `---
+lesson: b-2
+title: "Demo"
+stamp: "Verified against Claude Code v2.1.285 (stable) on 2026-10-05"
+next: b-3
+---
+
+## intro
+- minutes: "about 20 minutes"
+- can: "do it"
+
+## warm-up
+
+### R1 | Warm-up | Status
+- tier: challenge
+- skill: status
+- from: b-1
+- beat: ask
+- ask: Which command shows the account?
+- right: "\`/status\`"
+- wrong: "\`/usage\`"
+- because: "Usage is something else."
+
+### R2 | Warm-up | Version
+- tier: challenge
+- skill: save-version
+- from: b-1
+- beat: type
+- ask: Which command prints the version?
+- accept: claude --version
+- reveal: "\`claude --version\`"
+
+### R3 | Warm-up | Exit
+- tier: challenge
+- skill: exit
+- from: b-1
+- beat: ask
+- ask: How do you end a session?
+- right: "\`/exit\`"
+- wrong: "\`/clear\`"
+- because: "Clear is something else."
+
+## steps
+
+### W1 | Worked example step 1 of 1 | Save the list
+- tier: guided
+- skill: snapshot
+- where: shell
+- beat: do
+- verify: check 0
+- watching: .practice/b-2-before.txt
+- evidence: .practice/b-2-before.txt
+- run: "git status --porcelain > .practice/b-2-before.txt"
+
+### Y1 | Your turn step 1 of 1 | Save it again
+- tier: challenge
+- skill: snapshot
+- where: shell
+- beat: do
+- verify: check 0 fresh
+- watching: .practice/b-2-before.txt
+- evidence: .practice/b-2-before.txt
+- goal: "Save it again."
+
+### C | Check | Check
+- tier: challenge
+- skill: check
+- where: terminal
+- beat: do
+- verify: check all
+- goal: "Run the check."
+`;
+
+// Lesson 1 alone by default; lessonScreens passes the whole course.
+export function driver({ saved = null, facts = {}, course: lessons = b1Only } = {}) {
+  let now = 1_000;
+  let state = initialState({ course: lessons, saved, facts: { ...FACTS, ...facts }, now });
+  const effects = [];
+  const send = (ev) => {
+    now += ev.wait ?? 3_000;
+    const r = reduce(state, { now, ...ev });
+    state = r.state;
+    effects.push(...r.effects);
+    return r.effects;
+  };
+  // A key press as a person makes it: then a pause, so a held letter acts.
+  const press = (name, ch, wait) => {
+    const out = send({ type: 'key', name, ch: ch ?? (name.length === 1 ? name : name === 'space' ? ' ' : undefined), wait });
+    return [...out, ...send({ type: 'flush', wait: DEFER_MS + 50 })];
+  };
+  const key = (name, ch) => press(name, ch);
+  return { send, key, press, effects, get state() { return state; }, get now() { return now; } };
+}
+
+// Every screen of lesson 1, in order, as [label, state] pairs.
+export function allScreens() {
+  const d = driver();
+  const out = [];
+  const snap = (label) => out.push([label, d.state]);
+  const missing = b1Item(null);
+  const empty = b1Item('');
+  const passed = b1Item('2.1.285 (Claude Code)\n');
+  snap('welcome');
+  d.key('enter'); snap('intro');
+  d.key('enter'); snap('W1');
+  d.key('space'); snap('W2');
+  d.key('2'); snap('W2 stuck');
+  d.key('1'); snap('W2 right');
+  d.key('enter'); snap('W3 opening');
+  d.send({ type: 'check', lesson: 'b-1', items: [missing] }); snap('W3 waiting');
+  d.send({ type: 'check', lesson: 'b-1', items: [empty] }); snap('W3 not yet');
+  d.key('h'); snap('W3 hint 1');
+  d.key('h'); snap('W3 hint 2');
+  d.key('h'); snap('W3 hint 3');
+  d.key('h'); snap('W3 confirm');
+  d.key('y'); snap('W3 bottom');
+  d.key('w'); snap('W3 why');
+  d.key('w');
+  d.send({ type: 'check', lesson: 'b-1', items: [passed], evidence: '2.1.285 (Claude Code)' }); snap('W3 done');
+  d.key('enter'); snap('W4 predict');
+  d.key('2'); snap('W4 guessed');
+  d.key('enter'); snap('W4 sign in');
+  d.key('space'); snap('W4 trust');
+  d.key('space'); snap('W5');
+  d.key('w'); snap('W5 why');
+  d.key('w');
+  d.key('1'); snap('W5 wrong');
+  d.key('s'); snap('W5 revealed');
+  d.key('enter'); snap('W6');
+  d.key('enter'); snap('W6 ask');
+  d.key('2'); snap('W6 decoy');
+  d.key('1'); snap('W6 right');
+  d.key('enter'); snap('W7 predict');
+  d.key('2'); snap('W7 guessed');
+  d.key('enter'); snap('W7 exit');
+  d.key('space'); snap('W7 git opening');
+  d.send({ type: 'git', paths: ['src/notes.md', 'test/new.test.js', 'a.txt', 'b.txt'] }); snap('W7 git dirty');
+  d.send({ type: 'git', paths: [] }); snap('W7 git clean');
+  // The bottom rung at W3 eased save-version: Y1 comes back GUIDED, so the
+  // level-up waits for Y2.
+  d.key('enter'); snap('Y1 eased');
+  d.send({ type: 'check', lesson: 'b-1', items: [passed], evidence: '2.1.285 (Claude Code)' }); snap('Y1 already');
+  d.key('enter'); snap('level up hinted');
+  d.key('enter'); snap('Y2');
+  d.key('1'); snap('Y2 option');
+  d.key('enter'); snap('Y3');
+  d.key('h'); snap('Y3 hint');
+  d.key('space'); snap('level up challenge');
+  d.key('enter'); snap('Y4 opening');
+  d.send({ type: 'git', paths: ['notes.md'] }); snap('Y4 live dirty');
+  d.send({ type: 'tick', wait: 121_000 }); snap('Y4 idle');
+  d.send({ type: 'git', paths: [] }); snap('Y4 live clean');
+  d.send({ type: 'paste', text: 'claude --version' }); snap('Y4 stray');
+  d.key('space'); d.send({ type: 'git', paths: ['notes.md'] }); snap('Y4 not yet');
+  d.send({ type: 'git', paths: [] }); snap('Y4 done');
+  d.key('enter'); d.send({ type: 'check', lesson: 'b-1', items: [passed] }); snap('C check');
+  d.key('enter'); for (const c of '/usage') d.key(c, c); snap('C typing');
+  d.key('enter'); snap('C wrong');
+  d.key('enter'); snap('C revealed');
+  d.key('enter'); snap('C self');
+  d.key('space'); snap('complete');
+  d.key('enter'); snap('next');
+  d.key('m'); snap('map');
+  d.key('?'); snap('help');
+  d.key('?'); d.key('down'); d.key('enter'); snap('check-only');
+  d.send({ type: 'check', lesson: 'b-2', items: [{ index: 0, text: 'x', pass: true, hint: '' }, { index: 1, text: 'y', pass: false, hint: 'no' }] }); snap('check-only results');
+  d.key('p'); snap('page');
+  const r = driver({ saved: { format: 1, welcomed: true, eased: [], lessons: { 'b-1': { step: 'Y3', beat: 0, done: ['W1'] } } } });
+  out.push(['resume', r.state]);
+  r.key('x');
+  out.push(['resume confirm', r.state]);
+  r.key('n');
+  r.send({ type: 'check-error', lesson: 'b-1', message: 'boom' });
+  r.key('enter'); out.push(['Y3 resumed', r.state]);
+  const b = driver({ saved: { format: 1, welcomed: true, lessons: { 'b-1': { step: 'W3', beat: 0 } } } });
+  b.key('enter'); b.send({ type: 'check-error', lesson: 'b-1', message: 'it took too long' });
+  out.push(['W3 broken', b.state]);
+  return out;
+}
+
+// Screens of every step and beat of a lesson: each opened from a saved place,
+// then waiting, failing, done, with a hint open, as its beat allows.
+export function lessonScreens(id, lessons = course) {
+  const l = lessons.find((x) => x.id === id);
+  const out = [];
+  const warm = l.content.warmup.slice(0, 2).map((w) => w.id);
+  const steps = [...warm.map((w) => l.content.warmup.find((x) => x.id === w)), ...l.content.steps];
+  const complete = Object.fromEntries(lessons.filter((x) => x.content && lessons.indexOf(x) < lessons.indexOf(l)).map((x) => [x.id, { complete: true }]));
+  steps.forEach((step) => step.beats.forEach((beat, b) => {
+    const d = driver({ course: lessons, saved: { format: 1, welcomed: true, lessons: { ...complete, [id]: { step: step.id, beat: b, warm, levels: ['hinted', 'challenge'] } } } });
+    d.key('enter');
+    const at = `${id} ${step.id}.${b}`;
+    out.push([`${at} open`, d.state]);
+    const v = beat.verify;
+    if (v.kind === 'check') {
+      const items = (v.all ? l.items.map((_, i) => i) : v.items).map((index) => ({ index, text: l.items[index], pass: false, hint: `${l.items[index]} is not there yet: do the step, then look again.` }));
+      d.send({ type: 'check', lesson: id, items, path: beat.evidence ?? null, stamp: 'a' });
+      out.push([`${at} waiting`, d.state]);
+      d.key('r');
+      d.send({ type: 'check', lesson: id, items, path: beat.evidence ?? null, stamp: 'b' });
+      out.push([`${at} fail`, d.state]);
+      for (let i = 0; i < 6; i++) {
+        d.send({ type: 'key', name: 'h', ch: 'h', wait: 3_000 });
+        d.send({ type: 'flush', wait: 400 });
+        out.push([`${at} hint ${i + 1}`, d.state]);
+        if (d.state.beat?.confirm) {
+          d.key('y');
+          out.push([`${at} bottom`, d.state]);
+          break;
+        }
+      }
+      d.send({ type: 'check', lesson: id, items: items.map((it) => ({ ...it, pass: true, hint: '' })), evidence: 'a line of evidence', path: beat.evidence ?? null, stamp: 'c' });
+      out.push([`${at} done`, d.state]);
+    } else if (v.kind === 'file') {
+      d.send({ type: 'file', path: v.path, line: null, stamp: '' });
+      out.push([`${at} waiting`, d.state]);
+      d.send({ type: 'file', path: v.path, line: 'src/config.js', stamp: 'x' });
+      out.push([`${at} done`, d.state]);
+    } else if (v.kind === 'git-clean') {
+      d.send({ type: 'git', paths: ['src/config.js', 'test/config.test.js'] });
+      out.push([`${at} dirty`, d.state]);
+      d.send({ type: 'git', paths: [] });
+      out.push([`${at} clean`, d.state]);
+    } else if (beat.ask && beat.kind !== 'type') {
+      const wrong = beat.options.findIndex((o) => o.kind === 'wrong' || o.kind === 'decoy');
+      if (wrong >= 0) {
+        d.key(String(wrong + 1));
+        out.push([`${at} wrong`, d.state]);
+      }
+      d.key(String(beat.options.findIndex((o) => o.kind === 'right' || o.kind === 'option') + 1));
+      out.push([`${at} answered`, d.state]);
+    } else if (beat.kind === 'type') {
+      d.key('enter');
+      out.push([`${at} revealed`, d.state]);
+    } else if (rungsAt(d)) {
+      for (let i = 0; i < 6 && !d.state.beat?.confirm; i++) {
+        d.send({ type: 'key', name: 'h', ch: 'h', wait: 3_000 });
+        d.send({ type: 'flush', wait: 400 });
+        out.push([`${at} hint ${i + 1}`, d.state]);
+      }
+      if (d.state.beat?.confirm) {
+        d.key('y');
+        out.push([`${at} bottom`, d.state]);
+      }
+    }
+  }));
+  return out;
+}
+const rungsAt = (d) => d.state.view === 'step' && d.state.beat && !['done', 'already'].includes(d.state.beat.status);

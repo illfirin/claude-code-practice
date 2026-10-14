@@ -1,0 +1,859 @@
+// Every transition of the app, as a pure function: reduce(state, event)
+// returns { state, effects }. Effects ask the wiring in main.mjs to run a
+// check, read git status, save progress or quit; their results come back as
+// events. Nothing here reads a file, a clock or the terminal.
+import { C } from './copy.mjs';
+import { effectiveTier, ruleTiers, TIERS } from './tiers.mjs';
+
+export const IDLE_MS = 120_000;
+export const HINT_LOCK_MS = 2_000;
+export const DEFER_MS = 300;
+const SWALLOW_MS = 800;
+const TOAST_MS = 5_000;
+
+const clone = (x) => structuredClone(x);
+const blankProgress = () => ({ step: null, beat: 0, done: [], answers: {}, levels: [], lessHelp: false, keepGuided: false, easedSteps: {}, complete: false, warm: [], stamps: {}, bottomAt: null });
+// How many warm-up questions open a lesson that has them.
+export const WARMUPS = 2;
+
+export function initialState({ course, saved = null, facts, now = 0 }) {
+  const progress = {};
+  for (const l of course) {
+    const p = saved?.lessons?.[l.id];
+    progress[l.id] = { ...blankProgress(), ...(p ?? {}) };
+    if (l.content) {
+      // Unknown step ids from an older content file start that lesson's place over.
+      const pr = progress[l.id];
+      pr.warm = pr.warm.filter((id) => l.content.warmup.some((w) => w.id === id));
+      const steps = playOrder(l.content, pr);
+      const ids = new Set(steps.map((s) => s.id));
+      pr.done = pr.done.filter((id) => ids.has(id));
+      const step = steps.find((x) => x.id === pr.step);
+      if (!step) Object.assign(pr, { step: null, beat: 0 });
+      else if (!(pr.beat >= 0 && pr.beat < step.beats.length)) pr.beat = 0;
+    }
+  }
+  const open = course.find((l) => l.content && progress[l.id].step && !progress[l.id].complete)
+    ?? course.find((l) => l.content && !progress[l.id].complete);
+  // Every lesson in the app is done: open the map at the next lesson.
+  const next = open ?? course.find((l) => !progress[l.id].complete) ?? course[0];
+  const welcomed = Boolean(saved?.welcomed);
+  return {
+    course, facts, progress, now,
+    eased: saved?.eased ?? [],
+    missed: saved?.missed ?? [],
+    missedNow: [],
+    welcomed,
+    view: !welcomed ? 'welcome' : !open ? 'map' : progress[open.id].step ? 'resume' : 'intro',
+    overlay: null, lesson: next.id, pos: { step: 0, beat: 0 }, beat: null,
+    checks: {}, git: null, session: 0, cursor: 0, mapCursor: course.indexOf(next), toast: null,
+    held: null, swallowUntil: 0, confirmRestart: false, lastActivity: now,
+  };
+}
+
+// ---- lookups -----------------------------------------------------------------
+export const lessonOf = (s, id = s.lesson) => s.course.find((l) => l.id === id);
+export const contentOf = (s, id = s.lesson) => lessonOf(s, id)?.content;
+// The steps a learner meets, in order: the warm-up questions chosen when the
+// lesson started, then the lesson's own steps.
+const playOrder = (content, p) => [...p.warm.map((id) => content.warmup.find((w) => w.id === id)).filter(Boolean), ...content.steps];
+export const stepsOf = (s, id = s.lesson) => (contentOf(s, id) ? playOrder(contentOf(s, id), s.progress[id]) : []);
+export const stepOf = (s) => stepsOf(s)[s.pos.step];
+export const beatOf = (s) => stepOf(s).beats[s.pos.beat];
+
+// Each step's tier in play order. A warm-up recalls an earlier lesson from
+// memory, so it is always CHALLENGE and counts toward no skill's fading.
+export function tiersOf(s, id = s.lesson) {
+  const contents = s.course.map((l) => l.content);
+  const idx = s.course.findIndex((l) => l.id === id);
+  const p = s.progress[id];
+  const rule = ruleTiers(contents, idx);
+  return stepsOf(s, id).map((step) => {
+    if (step.part === 'Warm-up') return 'challenge';
+    if (p.keepGuided && step.part !== 'Check') return 'guided';
+    const t = rule[contents[idx].steps.indexOf(step)];
+    return effectiveTier(t, { lessHelp: p.lessHelp, eased: Boolean(p.easedSteps[step.id]) });
+  });
+}
+export function authoredTier(s) {
+  const step = stepOf(s);
+  if (step.part === 'Warm-up') return 'challenge';
+  const idx = s.course.findIndex((l) => l.id === s.lesson);
+  return ruleTiers(s.course.map((l) => l.content), idx)[contentOf(s).steps.indexOf(step)];
+}
+export const tierOf = (s) => tiersOf(s)[s.pos.step];
+
+// What the wiring should keep an eye on for the beat on screen.
+export function watching(s) {
+  if (s.view === 'checkonly') return { check: { lesson: s.lesson, items: null } };
+  if (s.view !== 'step' || !s.beat) return null;
+  if (['done', 'already'].includes(s.beat.status)) return null;
+  const v = beatOf(s).verify;
+  if (v.kind === 'check') return { check: { lesson: s.lesson, items: v.all ? null : v.items } };
+  if (v.kind === 'file') return { file: v.path };
+  if (v.kind === 'git-clean') return { git: true };
+  return null;
+}
+
+// ---- hints -------------------------------------------------------------------
+// Point, then teach, then the exact command after a y/n: the check's own
+// question for its FAIL message first, the lesson's words next, the bottom
+// line last.
+export function rungsOf(s) {
+  const beat = beatOf(s);
+  const lesson = contentOf(s);
+  const st = s.beat;
+  const rungs = [];
+  let bottom = [];
+  const hideRuns = tierOf(s) !== 'guided' && authoredTier(s) === 'guided';
+  const runs = beat.lines.filter((l) => l.key === 'run').map((l) => ({ text: l.text, win: l.win }));
+  if (st.status === 'fail' && st.fail?.item) {
+    const ladder = lesson.ladder.find((l) => l.item === st.fail.item);
+    const narrow = ladder?.narrow.find((n) => st.fail.hint.includes(n.part));
+    if (narrow) rungs.push({ kind: 'ask', text: narrow.question });
+    rungs.push({ kind: 'check', text: st.fail.hint });
+    for (const h of ladder?.hints ?? []) rungs.push({ kind: 'quote', text: h });
+    bottom = ladder?.bottom ?? [];
+  }
+  for (const h of beat.hints) rungs.push({ kind: 'quote', text: h });
+  if (!bottom.length) bottom = [...(hideRuns ? runs : []), ...beat.bottom];
+  if (bottom.length) rungs.push({ kind: 'bottom', lines: bottom });
+  return rungs;
+}
+
+export function hintAvailable(s) {
+  if (s.view !== 'step' || !s.beat || ['done', 'already'].includes(s.beat.status)) return false;
+  if (beatOf(s).kind === 'type') return false;
+  const rungs = rungsOf(s);
+  if (!rungs.length || s.beat.rung >= rungs.length - 1) return false;
+  if (tierOf(s) === 'challenge') return s.beat.status === 'fail' || s.beat.unlocked;
+  return true;
+}
+
+// ---- moving through a lesson -------------------------------------------------
+function openBeat(s, effects) {
+  const step = stepOf(s);
+  const beat = beatOf(s);
+  const p = s.progress[s.lesson];
+  p.step = step.id;
+  p.beat = s.pos.beat;
+  markEased(s, s.pos.step);
+  s.beat = { status: 'waiting', rung: -1, lockUntil: 0, confirm: false, wrongs: [], answer: null, revealed: false, typed: '', typedWrong: 0, feedback: null, idle: false, unlocked: false, explicit: false, ended: false, opened: s.now, eased: Boolean(p.easedSteps[step.id]) };
+  s.lastActivity = s.now;
+  // Nothing is picked until the learner picks: an Enter meant for the screen
+  // before can't answer a question.
+  s.cursor = beat.ask && beat.options.length ? -1 : 0;
+  if (beat.codespace && s.facts.codespace) {
+    s.beat.status = 'already';
+    s.beat.codespace = true;
+  } else if (beat.verify.kind === 'check') {
+    s.beat.status = 'opening';
+    effects.push({ type: 'check', lesson: s.lesson, items: beat.verify.all ? null : beat.verify.items, evidence: beat.evidence ?? null });
+  } else if (beat.verify.kind === 'file') {
+    s.beat.status = 'opening';
+    effects.push({ type: 'file', path: beat.verify.path });
+  } else if (beat.verify.kind === 'git-clean') {
+    s.beat.status = 'opening';
+    effects.push({ type: 'git' });
+  }
+  effects.push({ type: 'save' });
+}
+
+// A fresh check compares its file with how it was when its step opened (or
+// the step it names): ask for that file's state now, once.
+function stampFresh(s, effects) {
+  const step = stepOf(s);
+  const stamps = s.progress[s.lesson].stamps;
+  for (const other of stepsOf(s)) {
+    other.beats.forEach((b, i) => {
+      const key = `${other.id}.${i}`;
+      if (b.verify.fresh && (b.verify.since ?? other.id) === step.id && !(key in stamps)) effects.push({ type: 'stamp', key, path: b.evidence });
+    });
+  }
+}
+
+// A skill that needed the bottom rung comes back one tier easier, once: at
+// the next step that asks for it.
+function markEased(s, index) {
+  const step = stepsOf(s)[index];
+  const p = s.progress[s.lesson];
+  // A warm-up is always from memory: the ease waits for the lesson's own step.
+  if (step.part === 'Warm-up') return;
+  // Nor does the rest of the step whose bottom rung it was.
+  if (p.bottomAt === step.id) return;
+  if (s.eased.includes(step.skill) && !p.easedSteps[step.id] && !p.done.includes(step.id)) {
+    p.easedSteps[step.id] = true;
+    s.eased = s.eased.filter((k) => k !== step.skill);
+  }
+}
+
+function openStep(s, index, effects) {
+  markEased(s, index);
+  const tiers = tiersOf(s);
+  const steps = stepsOf(s);
+  const prev = index > 0 ? tiers[index - 1] : null;
+  const p = s.progress[s.lesson];
+  s.pos = { step: index, beat: 0 };
+  stampFresh(s, effects);
+  // Less help than the step before. A level-up says the help stays lower from
+  // here on, so it shows only when no later step of the lesson gets more help;
+  // a step that is harder on its own gets a line on its card instead.
+  const { harder, stays } = climb(s, index, tiers, steps);
+  if (harder && stays && !p.levels.includes(tiers[index])) {
+    s.view = 'levelup';
+    s.levelTo = tiers[index];
+    s.levelFrom = prev;
+    s.beat = null;
+    p.step = stepOf(s).id;
+    p.beat = 0;
+    effects.push({ type: 'save' });
+    return;
+  }
+  s.view = 'step';
+  openBeat(s, effects);
+}
+
+// Whether step `index` gives less help than the one before, and whether the
+// help stays that low for the rest of the lesson. An ease still pending for a
+// later step's skill counts: that step will come back one tier easier.
+function climb(s, index, tiers = tiersOf(s), steps = stepsOf(s)) {
+  const rank = (t) => TIERS.indexOf(t);
+  const prev = index > 0 ? tiers[index - 1] : null;
+  const harder = Boolean(prev) && rank(tiers[index]) > rank(prev);
+  const pending = new Set(s.eased);
+  const done = new Set(s.progress[s.lesson].done);
+  const stays = steps.slice(index + 1).every((step, k) => {
+    if (step.part === 'Warm-up') return true;
+    let r = rank(tiers[index + 1 + k]);
+    if (pending.has(step.skill) && !done.has(step.id)) {
+      pending.delete(step.skill);
+      r = Math.max(0, r - 1);
+    }
+    return r >= rank(tiers[index]);
+  });
+  return { harder, stays };
+}
+
+// The line a step that is harder on its own shows instead of a level-up:
+// its tier, or null.
+export function stepNote(s) {
+  if (s.view !== 'step' || !s.beat || stepOf(s).part === 'Warm-up') return null;
+  const { harder, stays } = climb(s, s.pos.step);
+  return harder && !stays ? tierOf(s) : null;
+}
+
+export function startLesson(s, id, effects) {
+  s.lesson = id;
+  s.overlay = null;
+  const l = lessonOf(s, id);
+  if (!l.content) {
+    s.view = 'checkonly';
+    effects.push({ type: 'check', lesson: id, items: null });
+    return;
+  }
+  const p = s.progress[id];
+  const steps = stepsOf(s, id);
+  const at = steps.findIndex((x) => x.id === p.step);
+  if (at !== -1 && !p.complete) {
+    s.pos = { step: at, beat: p.beat >= 0 && p.beat < steps[at].beats.length ? p.beat : 0 };
+    s.view = 'step';
+    openBeat(s, effects);
+  } else {
+    s.view = 'intro';
+    s.cursor = 0;
+  }
+}
+
+function finishStep(s, effects) {
+  const step = stepOf(s);
+  const p = s.progress[s.lesson];
+  if (!p.done.includes(step.id)) {
+    p.done.push(step.id);
+    s.session += 1;
+  }
+  const steps = stepsOf(s);
+  if (s.pos.step + 1 >= steps.length) {
+    p.complete = true;
+    p.step = null;
+    s.view = 'complete';
+    s.beat = null;
+    effects.push({ type: 'save' });
+    return;
+  }
+  openStep(s, s.pos.step + 1, effects);
+}
+
+function advance(s, effects) {
+  if (s.pos.beat + 1 < stepOf(s).beats.length) {
+    s.pos.beat += 1;
+    openBeat(s, effects);
+  } else finishStep(s, effects);
+}
+
+function back(s, effects) {
+  if (s.pos.beat > 0) {
+    s.pos.beat -= 1;
+    openBeat(s, effects);
+  } else if (s.pos.step > 0) {
+    s.pos = { step: s.pos.step - 1, beat: stepsOf(s)[s.pos.step - 1].beats.length - 1 };
+    s.view = 'step';
+    openBeat(s, effects);
+  }
+}
+
+// Picks the lesson's warm-up questions as it starts: questions on a skill the
+// learner missed before come first, then the rest in the file's order.
+export function pickWarmups(s, id = s.lesson) {
+  const pool = contentOf(s, id).warmup;
+  const missed = pool.filter((w) => s.missed.includes(w.skill));
+  return [...missed, ...pool.filter((w) => !missed.includes(w))].slice(0, WARMUPS).map((w) => w.id);
+}
+function chooseWarmups(s) {
+  s.progress[s.lesson].warm = pickWarmups(s);
+}
+
+// A question answered wrong, or shown, marks its skill for a warm-up later;
+// a warm-up on that skill answered right at once clears the mark, unless it
+// was missed again in this sitting. A beat may name the skill it recalls.
+const skillOf = (s) => beatOf(s).skill ?? stepOf(s).skill;
+function missed(s, effects) {
+  const skill = skillOf(s);
+  if (!s.missed.includes(skill)) s.missed.push(skill);
+  if (!s.missedNow.includes(skill)) s.missedNow.push(skill);
+  effects.push({ type: 'save' });
+}
+function recalled(s) {
+  const st = s.beat;
+  const skill = skillOf(s);
+  if (stepOf(s).part === 'Warm-up' && !st.wrongs.length && !st.typedWrong && !s.missedNow.includes(skill)) s.missed = s.missed.filter((k) => k !== skill);
+}
+
+// ---- questions ---------------------------------------------------------------
+export const answerKey = (s) => `${stepOf(s).id}.${s.pos.beat}`;
+const questionOf = (beat) => (beat.ask ? beat : null);
+
+function pick(s, index, effects) {
+  const beat = beatOf(s);
+  const st = s.beat;
+  const opt = beat.options[index];
+  if (!opt || st.answer) return;
+  const p = s.progress[s.lesson];
+  if (beat.kind === 'predict') {
+    st.answer = { index, kind: opt.kind };
+    p.answers[answerKey(s)] = opt.text;
+    st.status = 'done';
+    effects.push({ type: 'save' });
+    return;
+  }
+  if (opt.kind === 'right' || opt.kind === 'option' || opt.kind === 'other') {
+    st.answer = { index, kind: opt.kind };
+    st.feedback = opt.kind === 'right' ? { kind: 'right' } : { kind: opt.kind, because: opt.because };
+    st.status = 'done';
+    if (opt.kind === 'right') recalled(s);
+    effects.push({ type: 'save' });
+    return;
+  }
+  if (opt.kind === 'stuck') {
+    st.feedback = { kind: 'stuck', because: opt.because };
+    return;
+  }
+  // A wrong pick or a decoy: explain once, reveal on the second.
+  if (!st.wrongs.includes(index)) st.wrongs.push(index);
+  missed(s, effects);
+  if (st.wrongs.length >= 2) return reveal(s, effects);
+  st.feedback = { kind: 'wrong', because: opt.because, point: beat.point };
+}
+
+function reveal(s, effects) {
+  const beat = beatOf(s);
+  const st = s.beat;
+  st.revealed = true;
+  missed(s, effects);
+  st.answer = { index: beat.options.findIndex((o) => o.kind === 'right'), kind: 'revealed' };
+  st.feedback = { kind: 'revealed' };
+  st.status = 'done';
+  effects.push({ type: 'save' });
+}
+
+// Case, spaces, a leading slash and the + or - between keys don't matter, and
+// Escape is Esc.
+export const normalize = (text) => text.trim().toLowerCase().replace(/[+\-\s]+/g, '').replace(/^\//, '').replace(/^escape$/, 'esc');
+
+function submitTyped(s, effects) {
+  const beat = beatOf(s);
+  const st = s.beat;
+  const typed = normalize(st.typed);
+  if (!typed) return reveal(s, effects);
+  if (beat.accept.some((a) => normalize(a) === typed)) {
+    st.status = 'done';
+    st.feedback = { kind: 'right' };
+    recalled(s);
+    effects.push({ type: 'save' });
+    return;
+  }
+  st.typedWrong += 1;
+  missed(s, effects);
+  if (st.typedWrong >= 2) return reveal(s, effects);
+  const known = beat.options.find((o) => o.kind === 'wrong' && normalize(o.text) === typed);
+  st.feedback = known ? { kind: 'wrong', because: known.because } : { kind: 'wrong', hint: beat.hints[0] };
+  st.typed = '';
+}
+
+// ---- checks and git ----------------------------------------------------------
+function onCheck(s, ev, effects) {
+  s.checks[ev.lesson] = { items: ev.items, evidence: ev.evidence ?? null, error: null };
+  if (s.view !== 'step' || ev.lesson !== s.lesson || !s.beat) return;
+  const beat = beatOf(s);
+  if (beat.verify.kind !== 'check') return;
+  const st = s.beat;
+  if (['done', 'already'].includes(st.status)) return;
+  const indexes = beat.verify.all ? lessonOf(s).items.map((_, i) => i) : beat.verify.items;
+  const wanted = indexes.map((i) => ev.items.find((it) => it.index === i));
+  // A result that doesn't cover every item decides nothing.
+  if (wanted.some((it) => !it)) return;
+  const failing = wanted.find((it) => !it.slow && !it.pass);
+  // Everything else passes, and a slow item waits for r: say so, in place of
+  // any message about the items that pass now. A FAIL about a slow item stays
+  // with its hints: a run without that item can't tell whether it passes now.
+  if (!failing && wanted.some((it) => it.slow)) {
+    if (st.status === 'fail' && wanted.some((it) => it.slow && it.text === st.fail?.item)) {
+      st.slowWait = true;
+      return;
+    }
+    if (st.baseline === undefined) st.baseline = null;
+    Object.assign(st, { status: 'waiting', slowWait: true, fail: null, error: null, rung: -1, confirm: false, explicit: false });
+    return;
+  }
+  st.slowWait = false;
+  decide(s, ev, effects, failing && { item: failing.text, hint: failing.hint });
+}
+
+// A file no check item covers: done once it holds a line.
+function onFile(s, ev, effects) {
+  if (s.view !== 'step' || !s.beat) return;
+  const v = beatOf(s).verify;
+  if (v.kind !== 'file' || ev.path !== v.path || ['done', 'already'].includes(s.beat.status)) return;
+  // A list shows its first line and how many more, so a short list shows.
+  const more = (ev.lines ?? 1) - 1;
+  decide(s, { ...ev, evidence: ev.line && more > 0 ? C.andMore(ev.line, more) : ev.line }, effects, ev.line ? null : { hint: C.fileEmpty(ev.path) });
+}
+
+// Turns a result into the beat's status. `failing` is null when it passes.
+function decide(s, ev, effects, failing) {
+  const beat = beatOf(s);
+  const st = s.beat;
+  // A fresh check also needs its evidence file to have changed since its
+  // step opened; a result about another file decides nothing.
+  let stale = false;
+  if (beat.verify.fresh) {
+    // null: the file couldn't be read just now, so nothing is known yet.
+    if (ev.path !== beat.evidence || ev.stamp === null) return;
+    const stamps = s.progress[s.lesson].stamps;
+    const key = answerKey(s);
+    if (!(key in stamps)) {
+      stamps[key] = ev.stamp ?? '';
+      effects.push({ type: 'save' });
+    }
+    stale = (ev.stamp ?? '') === stamps[key];
+  }
+  const explicit = st.explicit;
+  st.explicit = false;
+  st.error = null;
+  if (!failing && stale) {
+    if (st.baseline === undefined) st.baseline = null;
+    st.status = 'waiting';
+    st.stale = true;
+    return;
+  }
+  st.stale = false;
+  if (!failing) {
+    st.status = st.baseline === undefined ? 'already' : 'done';
+    st.evidence = ev.evidence ?? null;
+    st.feedback = null;
+    st.rung = -1;
+    st.confirm = false;
+    effects.push({ type: 'save' });
+    return;
+  }
+  // The first answer is what the learner starts from: no "not yet" for it.
+  if (st.baseline === undefined) {
+    st.baseline = failing.hint;
+    if (!explicit) {
+      st.status = 'waiting';
+      return;
+    }
+  }
+  // Once a fail is on screen it follows the check; before that, a fail that
+  // only repeats the first answer means nothing changed yet.
+  if (st.status === 'fail' || failing.hint !== st.baseline || explicit) {
+    if (st.fail?.hint !== failing.hint) {
+      st.rung = -1;
+      st.confirm = false;
+    }
+    st.status = 'fail';
+    st.fail = failing;
+    st.unlocked = true;
+    st.idle = false;
+    s.lastActivity = s.now;
+  } else st.status = 'waiting';
+}
+
+function onGit(s, ev, effects) {
+  s.git = { paths: ev.paths, error: null };
+  if (s.view !== 'step' || !s.beat || beatOf(s).verify.kind !== 'git-clean') return;
+  const beat = beatOf(s);
+  const st = s.beat;
+  if (['done', 'already'].includes(st.status)) return;
+  const clean = ev.paths.length === 0;
+  // With a done-label, the tree decides only after the learner says the
+  // session has ended; before that it is shown live.
+  if (beat.doneLabel && !st.ended) {
+    if (st.status === 'opening') st.status = 'waiting';
+    return;
+  }
+  st.error = null;
+  if (clean) {
+    st.status = 'done';
+    st.rung = -1;
+    st.confirm = false;
+    effects.push({ type: 'save' });
+    return;
+  }
+  st.status = 'fail';
+  st.unlocked = true;
+  st.fail = { paths: ev.paths };
+  st.explicit = false;
+}
+
+// ---- the reducer -------------------------------------------------------------
+export function reduce(prev, ev) {
+  const s = clone({ ...prev, course: null });
+  s.course = prev.course;
+  const effects = [];
+  if (ev.now !== undefined) s.now = ev.now;
+  if (s.toast && s.now >= s.toast.until) s.toast = null;
+  switch (ev.type) {
+    case 'check':
+      onCheck(s, ev, effects);
+      break;
+    case 'check-error':
+      s.checks[ev.lesson] = { ...(s.checks[ev.lesson] ?? {}), error: ev.message };
+      if (s.view === 'step' && s.beat && beatOf(s).verify.kind === 'check' && !['done', 'already'].includes(s.beat.status)) {
+        Object.assign(s.beat, { status: 'broken', error: ev.message, rung: -1, confirm: false });
+      }
+      break;
+    case 'git':
+      onGit(s, ev, effects);
+      break;
+    case 'file':
+      onFile(s, ev, effects);
+      break;
+    case 'stamp': {
+      const stamps = s.progress[s.lesson]?.stamps;
+      if (stamps && !(ev.key in stamps) && ev.stamp !== null) {
+        stamps[ev.key] = ev.stamp ?? '';
+        effects.push({ type: 'save' });
+      }
+      break;
+    }
+    case 'git-error':
+      s.git = { paths: [], error: ev.message };
+      if (s.view === 'step' && s.beat && beatOf(s).verify.kind === 'git-clean' && !['done', 'already'].includes(s.beat.status)) {
+        Object.assign(s.beat, { status: 'broken', error: ev.message, rung: -1, confirm: false });
+      }
+      break;
+    case 'tick':
+    case 'flush':
+      // A held letter with nothing typed after it is a key press after all.
+      if (s.held && s.now - s.held.at >= DEFER_MS) {
+        const held = s.held;
+        s.held = null;
+        onKey(s, held, effects);
+      }
+      if (ev.type === 'tick' && s.view === 'step' && s.beat && !['done', 'already'].includes(s.beat.status) && s.now - s.lastActivity >= IDLE_MS) {
+        s.beat.idle = true;
+        s.beat.unlocked = true;
+      }
+      break;
+    case 'facts':
+      Object.assign(s.facts, ev.facts);
+      break;
+    case 'notice':
+      s.toast = { kind: ev.kind, message: ev.message, until: s.now + TOAST_MS * 2 };
+      break;
+    case 'activity':
+      // A file changed or git moved: the learner is working, so no "stuck?" offer.
+      s.lastActivity = s.now;
+      if (s.beat) s.beat.idle = false;
+      break;
+    case 'paste':
+      if (s.view === 'step' && s.beat && beatOf(s).kind === 'type' && s.beat.status !== 'done') {
+        s.beat.typed = (s.beat.typed + ev.text.replace(/[\r\n].*$/s, '')).slice(0, 40);
+      } else onPaste(s);
+      break;
+    case 'key':
+      s.lastActivity = s.now;
+      if (s.beat) s.beat.idle = false;
+      guardKey(s, ev, effects);
+      break;
+    default:
+      break;
+  }
+  return { state: s, effects };
+}
+
+function onPaste(s) {
+  s.held = null;
+  s.toast = { kind: 'stray', until: s.now + TOAST_MS };
+}
+
+const DIGIT = /^[1-9]$/;
+const typingAnswer = (s) => s.view === 'step' && s.beat && beatOf(s).kind === 'type' && s.beat.status !== 'done';
+const letter = (ev) => Boolean(ev.ch) && /^[\x21-\x7e]$/.test(ev.ch) && !DIGIT.test(ev.ch);
+
+// A command typed into this window instead of the other one must not act:
+// its first letter could go back (b), quit (q), or reveal an answer (s), and
+// a space could finish a step. So a letter waits DEFER_MS before it acts; a
+// second letter or a space inside that time means typing, and every key is
+// swallowed until the typing stops.
+function guardKey(s, ev, effects) {
+  if (ev.name === 'ctrl-c') return effects.push({ type: 'quit' });
+  if (typingAnswer(s) || s.overlay) {
+    s.held = null;
+    return onKey(s, ev, effects);
+  }
+  if (s.now < s.swallowUntil) {
+    s.swallowUntil = s.now + SWALLOW_MS;
+    return;
+  }
+  if (s.held) {
+    if (s.now - s.held.at < DEFER_MS && (letter(ev) || ev.name === 'space' || ev.name === 'enter')) {
+      s.held = null;
+      s.swallowUntil = s.now + SWALLOW_MS;
+      s.toast = { kind: 'stray', until: s.now + TOAST_MS };
+      return;
+    }
+    const held = s.held;
+    s.held = null;
+    onKey(s, held, effects);
+  }
+  if (letter(ev)) {
+    s.held = { ...ev, at: s.now };
+    effects.push({ type: 'later', ms: DEFER_MS + 30 });
+    return;
+  }
+  onKey(s, ev, effects);
+}
+
+function onKey(s, ev, effects) {
+  const { name, ch } = ev;
+  // Typing an answer: every printable key is input.
+  if (typingAnswer(s) && !s.overlay) {
+    if (name === 'enter') return submitTyped(s, effects);
+    if (name === 'backspace') s.beat.typed = s.beat.typed.slice(0, -1);
+    else if (name === 'escape') s.beat.typed = '';
+    else if (ch && ch >= ' ' && s.beat.typed.length < 40) s.beat.typed += ch;
+    return;
+  }
+  if (s.overlay) {
+    if (['escape', 'enter', 'q', '?', 'p', 'w'].includes(name)) s.overlay = null;
+    return;
+  }
+  if (name === 'q') return effects.push({ type: 'quit' });
+  if (name === '?') {
+    s.overlay = 'help';
+    return;
+  }
+  if (name === 'p' && s.view !== 'welcome') {
+    s.overlay = 'page';
+    return;
+  }
+  if (name === 'm' && s.view !== 'welcome') {
+    if (s.view === 'map') return closeMap(s, effects);
+    s.mapReturn = s.view;
+    s.view = 'map';
+    s.mapCursor = Math.max(0, s.course.findIndex((l) => l.id === s.lesson));
+    return;
+  }
+  VIEWS[s.view]?.(s, ev, effects);
+}
+
+function closeMap(s, effects) {
+  // The map the app opened on has no screen behind it: open its lesson.
+  if (!s.mapReturn) return startLesson(s, s.lesson, effects);
+  s.view = s.mapReturn;
+  if (s.view === 'step' && s.beat) {
+    // Re-run what the beat waits on: files may have changed meanwhile.
+    const w = watching(s);
+    if (w?.check) effects.push({ type: 'check', lesson: w.check.lesson, items: w.check.items, evidence: beatOf(s).evidence ?? null });
+    if (w?.file) effects.push({ type: 'file', path: w.file });
+    if (w?.git) effects.push({ type: 'git' });
+  }
+}
+
+const VIEWS = {
+  welcome(s, { name }, effects) {
+    if (name !== 'enter') return false;
+    s.welcomed = true;
+    s.view = 'intro';
+    s.cursor = 0;
+    effects.push({ type: 'save' });
+    return true;
+  },
+  resume(s, { name }, effects) {
+    if (s.confirmRestart) {
+      if (name === 'y') {
+        s.progress[s.lesson] = blankProgress();
+        s.view = 'intro';
+        s.cursor = 0;
+        effects.push({ type: 'save' });
+      }
+      s.confirmRestart = false;
+      return true;
+    }
+    if (name === 'enter') return startLesson(s, s.lesson, effects), true;
+    if (name === 'x') {
+      s.confirmRestart = true;
+      return true;
+    }
+    return false;
+  },
+  intro(s, { name, ch }, effects) {
+    if (name === 'up' || name === 'down') s.cursor = s.cursor ? 0 : 1;
+    else if (DIGIT.test(ch ?? '') && Number(ch) <= 2) s.cursor = Number(ch) - 1;
+    else if (name === 'enter') {
+      // A finished lesson played again keeps its badge and its ticks, but
+      // every fresh check waits for new work.
+      const p = s.progress[s.lesson];
+      p.lessHelp = s.cursor === 1;
+      p.stamps = {};
+      p.bottomAt = null;
+      chooseWarmups(s);
+      openStep(s, 0, effects);
+    } else return false;
+    return true;
+  },
+  levelup(s, { name }, effects) {
+    const p = s.progress[s.lesson];
+    if (name === 'enter' || name === 'g') {
+      if (!p.levels.includes(s.levelTo)) p.levels.push(s.levelTo);
+      if (name === 'g') p.keepGuided = true;
+      s.view = 'step';
+      openBeat(s, effects);
+      return true;
+    }
+    if (name === 'b') {
+      back(s, effects);
+      return true;
+    }
+    return false;
+  },
+  step(s, ev, effects) {
+    const { name, ch } = ev;
+    const beat = beatOf(s);
+    const st = s.beat;
+    const done = ['done', 'already'].includes(st.status);
+    if (done && name === 'enter') return advance(s, effects), true;
+    // The y/n before the exact command.
+    if (st.confirm && !done) {
+      if (name === 'y' || name === 'enter') {
+        st.confirm = false;
+        st.rung = rungsOf(s).length - 1;
+        st.lockUntil = s.now + HINT_LOCK_MS;
+        if (!s.eased.includes(stepOf(s).skill)) s.eased.push(stepOf(s).skill);
+        s.progress[s.lesson].bottomAt = stepOf(s).id;
+        effects.push({ type: 'save' });
+      } else if (name === 'n' || name === 'escape') st.confirm = false;
+      else return false;
+      return true;
+    }
+    if (name === 'b') return back(s, effects), true;
+    if (name === 'w' && beat.why.length) {
+      s.overlay = 'why';
+      return true;
+    }
+    if (name === 'r') {
+      const w = watching(s);
+      if (!w) return false;
+      st.explicit = true;
+      // A slow item takes a while: show that it runs.
+      if (st.slowWait) Object.assign(st, { status: 'opening', slowWait: false });
+      if (w.check) effects.push({ type: 'check', lesson: w.check.lesson, items: w.check.items, evidence: beat.evidence ?? null, slow: true });
+      if (w.file) effects.push({ type: 'file', path: w.file });
+      if (w.git) {
+        if (beat.doneLabel) st.ended = st.ended || st.status === 'fail';
+        effects.push({ type: 'git' });
+      }
+      return true;
+    }
+    // At CHALLENGE, hints wait for a first try: say so instead of ignoring h.
+    if (name === 'h' && !hintAvailable(s) && tierOf(s) === 'challenge' && !done && beat.kind !== 'type' && rungsOf(s).length) {
+      s.toast = { kind: 'hintsLater', until: s.now + TOAST_MS };
+      return true;
+    }
+    if (name === 'h' && hintAvailable(s)) {
+      if (s.now < st.lockUntil) return true;
+      const rungs = rungsOf(s);
+      if (st.rung + 1 === rungs.length - 1 && rungs.at(-1).kind === 'bottom') st.confirm = true;
+      else {
+        st.rung += 1;
+        st.lockUntil = s.now + HINT_LOCK_MS;
+      }
+      return true;
+    }
+    if (done) return false;
+    const q = questionOf(beat);
+    if (q && !st.answer) {
+      const n = beat.options.length;
+      if (name === 'up') s.cursor = s.cursor < 0 ? n - 1 : (s.cursor + n - 1) % n;
+      else if (name === 'down') s.cursor = (s.cursor + 1) % n;
+      else if (name === 'enter' && s.cursor < 0) s.toast = { kind: 'pickFirst', until: s.now + TOAST_MS };
+      else if (DIGIT.test(ch ?? '') && Number(ch) <= n) pick(s, Number(ch) - 1, effects), (s.cursor = Number(ch) - 1);
+      else if (name === 'enter') pick(s, s.cursor, effects);
+      else if (name === 's' && beat.kind !== 'predict' && beat.options.some((o) => o.kind === 'right')) reveal(s, effects);
+      else return false;
+      return true;
+    }
+    // Self, none and "the session has ended" beats.
+    const v = beat.verify.kind;
+    if ((name === 'space' || name === 'enter') && (v === 'self' || v === 'none' || beat.kind === 'self')) {
+      st.status = 'done';
+      advance(s, effects);
+      return true;
+    }
+    if ((name === 'space' || name === 'enter') && v === 'git-clean' && beat.doneLabel) {
+      st.ended = true;
+      st.explicit = true;
+      effects.push({ type: 'git' });
+      return true;
+    }
+    return false;
+  },
+  complete(s, { name }) {
+    if (name !== 'enter') return false;
+    s.view = 'next';
+    return true;
+  },
+  next(s, { name }, effects) {
+    if (name !== 'enter') return false;
+    const nextId = contentOf(s)?.next;
+    if (nextId && lessonOf(s, nextId)) startLesson(s, nextId, effects);
+    else s.view = 'map';
+    return true;
+  },
+  map(s, { name }, effects) {
+    const n = s.course.length;
+    if (name === 'up') s.mapCursor = (s.mapCursor + n - 1) % n;
+    else if (name === 'down') s.mapCursor = (s.mapCursor + 1) % n;
+    else if (name === 'enter') startLesson(s, s.course[s.mapCursor].id, effects);
+    else return false;
+    return true;
+  },
+  checkonly(s, { name }, effects) {
+    if (name === 'r') {
+      effects.push({ type: 'check', lesson: s.lesson, items: null, slow: true });
+      return true;
+    }
+    return false;
+  },
+};
