@@ -60,6 +60,113 @@ test('ignores links with a malformed title', () => {
   }
 });
 
+test('resolves full, collapsed and shortcut reference links', () => {
+  const md = [
+    '[a]: a.md',
+    'See [the text][a], [b][] and [c].',
+    '',
+    '[b]: b.md#top',
+    '[c]: c.md',
+  ].join('\n');
+  assert.deepEqual(
+    findLinks(md).map((l) => [l.text, l.target, l.line]),
+    [['the text', 'a.md', 2], ['b', 'b.md#top', 2], ['c', 'c.md', 2]],
+  );
+});
+
+test('reads reference definitions with titles, angle brackets and indentation', () => {
+  const md = [
+    '[double]: a.md "Title"',
+    "[single]: b.md 'Title'",
+    '[parens]: c.md (Title)',
+    '[angle]: <my file.md>',
+    ' [one]: d.md',
+    '   [three]: e.md',
+    '    [four]: f.md',
+    '[double] [single] [parens] [angle] [one] [three] [four]',
+  ].join('\n');
+  assert.deepEqual(
+    findLinks(md).map((l) => [l.text, l.target]),
+    [['double', 'a.md'], ['single', 'b.md'], ['parens', 'c.md'], ['angle', 'my file.md'], ['one', 'd.md'], ['three', 'e.md']],
+  );
+});
+
+test('matches reference labels ignoring case and spacing, and the first definition wins', () => {
+  const md = ['[Foo   Bar]', '[foo bar]: first.md', '[FOO BAR]: second.md'].join('\n');
+  assert.deepEqual(findLinks(md).map((l) => [l.text, l.target, l.line]), [['Foo   Bar', 'first.md', 1]]);
+});
+
+test('ignores references that are not links', () => {
+  const md = [
+    '[ref]: ref.md',
+    '- [ ] task and [x] done and [1] and [undefined][nope]',
+    '![img][ref]',
+    '`[ref]` and `[text][ref]`',
+    '```',
+    '[hidden]: hidden.md',
+    '[ref]',
+    '```',
+    '[hidden]',
+  ].join('\n');
+  assert.deepEqual(findLinks(md), []);
+});
+
+test('resolves every use of a definition, each on its own line', () => {
+  const md = ['[a]: a.md', '[x][a]', '', '[y][a] and [a]'].join('\n');
+  assert.deepEqual(
+    findLinks(md).map((l) => [l.text, l.target, l.line]),
+    [['x', 'a.md', 2], ['y', 'a.md', 4], ['a', 'a.md', 4]],
+  );
+});
+
+test('finds inline and reference links on the same line, in order', () => {
+  const md = ['[a](a.md) and [b][r] and ![i][r] and [c] and [d](d.md)', '[r]: r.md', '[c]: c.md'].join('\n');
+  assert.deepEqual(
+    findLinks(md).map((l) => [l.text, l.target]),
+    [['a', 'a.md'], ['b', 'r.md'], ['c', 'c.md'], ['d', 'd.md']],
+  );
+});
+
+test('reads back-to-back references separately', () => {
+  const md = ['[a]: a.md', '[b]: b.md', '[a][b][a]'].join('\n');
+  assert.deepEqual(findLinks(md).map((l) => [l.text, l.target]), [['a', 'b.md'], ['a', 'a.md']]);
+});
+
+test('prefers the inline target over a definition with the same label', () => {
+  assert.deepEqual(findLinks('[a](x.md)\n[a]: y.md').map((l) => l.target), ['x.md']);
+});
+
+test('keeps external and fragment-only reference targets as written', () => {
+  const md = ['[site][web] and [top][up]', '[web]: https://example.com', '[up]: #top'].join('\n');
+  const targets = findLinks(md).map((l) => l.target);
+  assert.deepEqual(targets, ['https://example.com', '#top']);
+  assert.deepEqual(targets.map(isExternal), [true, false]);
+});
+
+test('matches reference labels with non-ASCII letters', () => {
+  assert.deepEqual(findLinks('[ÄÖ]: u.md\n[äö]').map((l) => l.target), ['u.md']);
+});
+
+test('reads reference definitions in files with CRLF line endings', () => {
+  const md = '[a]: a.md\r\n[b]: <b c.md> "Title"\r\n[a] and [b]\r\n';
+  assert.deepEqual(findLinks(md).map((l) => [l.target, l.line]), [['a.md', 3], ['b c.md', 3]]);
+});
+
+test('ignores malformed definitions and empty labels', () => {
+  const md = [
+    '[a]: a.md extra words', // junk after the target
+    '[b]: b.md "unterminated', // unterminated title
+    '[c]:', // no target
+    '[]: d.md', // empty label
+    '[a] [b] [c] [] [][]',
+  ].join('\n');
+  assert.deepEqual(findLinks(md), []);
+});
+
+test('does not collect definitions from a ~~~ fence', () => {
+  assert.deepEqual(findLinks('~~~\n[h]: h.md\n~~~\n[h]\n'), []);
+});
+
 test('skips images and links inside code', () => {
   const md = '![logo](logo.png)\n`[not](a-link.md)`\n```\n[also not](code.md)\n```\n';
   assert.deepEqual(findLinks(md), []);
@@ -71,7 +178,19 @@ test('tells external links from relative ones', () => {
   assert.equal(isExternal('docs/setup.md'), false);
 });
 
+test('applies the ignore list and file list to reference links', () => {
+  assert.deepEqual(brokenLinks(samples, { files: ['.'], ignore: ['gone.md'] }), [
+    { file: 'guide.md', line: 5, target: 'missing.md' },
+  ]);
+  assert.deepEqual(brokenLinks(samples, { files: ['reference.md'], ignore: [] }), [
+    { file: 'reference.md', line: 3, target: 'gone.md' },
+  ]);
+});
+
 test('reports only the relative links whose file is missing', () => {
   const broken = brokenLinks(samples, { files: ['.'], ignore: [] });
-  assert.deepEqual(broken, [{ file: 'guide.md', line: 5, target: 'missing.md' }]);
+  assert.deepEqual(broken, [
+    { file: 'guide.md', line: 5, target: 'missing.md' },
+    { file: 'reference.md', line: 3, target: 'gone.md' },
+  ]);
 });
