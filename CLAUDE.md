@@ -32,7 +32,7 @@ node --test checks/test/learn-content.test.mjs                  # one checks-sid
 - `samples/` is a test fixture with intentionally broken links (`npm run linkcheck -- samples` is expected to report two). `test/links.test.js` depends on it, so don't "fix" those links.
 
 ## Conventions
-- Every new source file starts with the line // Part of linkcheck.
+- Every new source file starts with the line // linkcheck source.
 
 ## Working in this repo
 
